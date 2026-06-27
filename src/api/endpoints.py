@@ -36,7 +36,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 
 from src.services.signal_jobs import trigger_signal_jobs, update_lead_stage
-from src.tasks.celery_tasks import process_interaction_end_background_task
+from src.tasks.celery_tasks import classify_interaction_task
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -149,9 +149,9 @@ async def end_interaction(
                 "exotel_account_id": interaction.get("exotel_account_id"),
             }
 
-            task = process_interaction_end_background_task.apply_async(
+            task = classify_interaction_task.apply_async(
                 args=[celery_payload],
-                queue="postcall_processing",  # One queue to rule them all
+                queue="postcall_classify",
             )
 
             logger.info(
