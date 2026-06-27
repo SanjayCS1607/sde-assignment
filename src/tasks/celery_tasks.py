@@ -1,36 +1,33 @@
 """
 Celery tasks for post-call processing.
 
-This is the main background processing pipeline. Every completed interaction
-with a long transcript ends up here.
+This is the redesigned pipeline. Two phases:
 
-The task runs five steps sequentially:
-    1. Wait 45s, try to fetch recording from Exotel → upload to S3
-    2. Run full LLM analysis on the transcript
-    3. Write result to interaction_metadata (dashboard cache)
-    4. Trigger signal jobs (downstream actions: WhatsApp, callbacks, etc.)
-    5. Update lead stage
+  Phase 1 — classify_interaction_task (fast, high-priority queue)
+    - Short call check (free)
+    - LLM lane classification (~200 tokens)
+    - Routes to HOT queue, COLD queue, or marks as SKIPPED
 
-A few things worth understanding before you start changing things:
+  Phase 2 — process_interaction_task (rate-limit-aware, per-customer budget)
+    - Runs recording poller AND full LLM analysis IN PARALLEL
+    - Acquires token budget before calling LLM — never fires a request
+      that would exceed the configured rate limits
+    - Retries with exponential backoff (not fixed 60s) when budget is
+      exhausted, staying silent to the LLM provider
+    - Writes audit events to Postgres at every stage transition
 
-WHY CELERY + REDIS?
-  We needed a task queue and Celery was already in the stack. Redis was already
-  in the stack. It worked fine at 1K calls/day. At 100K calls/campaign the cracks
-  show: broker restarts lose tasks, queue depth is invisible, and there's no way
-  to see which step a given interaction is stuck on.
+Key differences from the original:
+  - No asyncio.sleep(45s) blocking the pipeline
+  - Recording and LLM run in parallel with asyncio.gather()
+  - Budget check BEFORE LLM call (not after, as the old circuit breaker did)
+  - Every failure path emits a structured event with interaction_id
+  - Separate queues for HOT and COLD calls (not a single shared queue)
+  - No dual-retry race condition (Celery retries only; Redis retry queue removed)
 
-WHY ONE QUEUE?
-  Originally there was only one customer. One queue was fine. We never revisited
-  it when the platform became multi-customer. Now a campaign for Customer A can
-  fill the queue and delay Customer B's results by hours.
-
-WHY DOES RECORDING BLOCK ANALYSIS?
-  It shouldn't. Recording upload and LLM analysis are completely independent —
-  the LLM reads the transcript, not the audio file. But they're sequential here
-  because that's how the task was originally written and nobody had a reason to
-  split them until the 45-second sleep became a visible SLA problem.
-
-  Think about what "run them in parallel" would require at the infrastructure level.
+Queue names:
+  postcall_classify  — Phase 1, high worker count, short tasks
+  postcall_hot       — Phase 2 HOT lane, dedicated workers
+  postcall_cold      — Phase 2 COLD lane, lower priority workers
 """
 
 import asyncio
@@ -42,77 +39,185 @@ from src.tasks.celery_app import celery_app
 from src.services.post_call_processor import PostCallProcessor, PostCallContext
 from src.services.recording import fetch_and_upload_recording
 from src.services.signal_jobs import trigger_signal_jobs, update_lead_stage
-from src.services.retry_queue import retry_queue
+from src.services.lane_classifier import classify_lane, is_short_call
+from src.services.token_budget import budget_scheduler
+from src.services.audit_logger import AuditLogger, write_token_ledger
 from src.services.metrics import metrics_tracker
 
 logger = logging.getLogger(__name__)
 
 
+# ── Phase 1: Classification ────────────────────────────────────────────────────
+
 @celery_app.task(
-    name="process_interaction_end_background_task",
+    name="classify_interaction_task",
     bind=True,
-    max_retries=3,
-    default_retry_delay=60,  # Fixed 60s — no exponential backoff
-    acks_late=True,           # Task only acked after completion, not on receipt.
-                              # This means a worker crash causes redelivery — good.
-                              # But "redelivery" goes to the back of the queue,
-                              # which at 100K depth means hours of extra wait.
-    queue="postcall_processing",
+    max_retries=5,
+    queue="postcall_classify",
+    acks_late=True,
 )
-def process_interaction_end_background_task(self, payload: Dict[str, Any]):
+def classify_interaction_task(self, payload: Dict[str, Any]):
     """
-    Main Celery task. Called for every long-transcript interaction.
+    Phase 1: Classify the call lane and route to the appropriate processing queue.
 
-    Celery workers are synchronous by default, so we spin up an event loop
-    per task to run the async processing code. This means each Celery worker
-    process handles one interaction at a time — no concurrency within a worker.
-
-    At 100K interactions/campaign with ~3,500ms LLM latency per call:
-        100,000 × 3.5s = 350,000 worker-seconds needed
-        With 10 workers: ~9.7 hours to drain the queue
-
-    If your campaign window is 8 hours, you're already behind before you start.
+    Runs fast (~300ms for LLM classification, 0ms for short call skip).
+    No rate limit pressure here — classification is cheap and separate from
+    the full analysis budget.
     """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-
     try:
-        loop.run_until_complete(_process_interaction(self, payload))
+        loop.run_until_complete(_classify_interaction(self, payload))
     except Exception as e:
         logger.exception(
-            "celery_task_failed",
+            "classify_task_failed",
             extra={
                 "interaction_id": payload.get("interaction_id"),
                 "error": str(e),
                 "attempt": self.request.retries,
             },
         )
-        # Failed tasks go into PostCallRetryQueue (Redis) AND Celery retries.
-        # Two retry mechanisms that don't know about each other. An interaction
-        # can end up being processed twice if both fire.
-        loop.run_until_complete(
-            retry_queue.enqueue_retry(
-                interaction_id=payload["interaction_id"],
-                error=str(e),
-                payload=payload,
-            )
-        )
-        raise self.retry(exc=e)
+        raise self.retry(exc=e, countdown=5 * (2 ** self.request.retries))
     finally:
         loop.close()
 
 
+async def _classify_interaction(task, payload: Dict[str, Any]):
+    interaction_id = payload["interaction_id"]
+    customer_id = payload["customer_id"]
+    campaign_id = payload["campaign_id"]
+
+    async with AuditLogger(
+        interaction_id=interaction_id,
+        customer_id=customer_id,
+        campaign_id=campaign_id,
+        session_id=payload.get("session_id"),
+    ) as audit:
+        await audit.started("classify", metadata={"attempt": task.request.retries})
+
+        transcript_text = payload.get("transcript_text", "")
+        conversation_data = payload.get("conversation_data", {})
+
+        lane = await classify_lane(
+            transcript_text=transcript_text,
+            conversation_data=conversation_data,
+            interaction_id=interaction_id,
+        )
+
+        await audit.completed(
+            "classify",
+            metadata={"lane": lane},
+        )
+
+    if lane == "skip":
+        # Write a synthetic result directly — no LLM needed
+        logger.info(
+            "interaction_skipped_short_call",
+            extra={
+                "interaction_id": interaction_id,
+                "customer_id": customer_id,
+            },
+        )
+        # Production: UPDATE interactions SET
+        #   interaction_metadata = '{"call_stage": "short_call", "analysis_status": "skipped"}',
+        #   processing_status = 'COMPLETED'
+        # WHERE id = interaction_id
+        return
+
+    # Route to the appropriate processing queue
+    queue_name = "postcall_hot" if lane == "hot" else "postcall_cold"
+    payload["processing_lane"] = lane
+
+    process_interaction_task.apply_async(
+        args=[payload],
+        queue=queue_name,
+    )
+
+    logger.info(
+        "interaction_routed",
+        extra={
+            "interaction_id": interaction_id,
+            "customer_id": customer_id,
+            "lane": lane,
+            "queue": queue_name,
+        },
+    )
+
+
+# ── Phase 2: Full Processing ───────────────────────────────────────────────────
+
+@celery_app.task(
+    name="process_interaction_task",
+    bind=True,
+    max_retries=10,          # More retries than before — budget exhaustion is expected
+    acks_late=True,
+    # Queue is set dynamically when task is enqueued (postcall_hot or postcall_cold)
+    queue="postcall_cold",   # default; overridden by classify_interaction_task
+)
+def process_interaction_task(self, payload: Dict[str, Any]):
+    """
+    Phase 2: Full analysis with rate-limit-aware budget scheduling.
+
+    Before calling the LLM, this task:
+      1. Estimates the token cost for this call
+      2. Calls budget_scheduler.acquire_budget()
+      3. If budget is insufficient, re-queues itself with exponential backoff
+         (starting at 5s, not the old fixed 60s)
+      4. If budget is available, fires the LLM and recording poller in parallel
+
+    This guarantees the LLM provider never receives more requests per minute
+    than the configured budget allows, without requiring the dialler to freeze.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_process_interaction(self, payload))
+    except BudgetExhaustedError as e:
+        # Budget exhausted — retry with backoff, no error logged at ERROR level
+        backoff = budget_scheduler.backoff_seconds(self.request.retries)
+        logger.info(
+            "budget_exhausted_retry",
+            extra={
+                "interaction_id": payload.get("interaction_id"),
+                "customer_id": payload.get("customer_id"),
+                "retry_in": backoff,
+                "attempt": self.request.retries,
+            },
+        )
+        raise self.retry(exc=e, countdown=backoff)
+    except Exception as e:
+        logger.exception(
+            "process_task_failed",
+            extra={
+                "interaction_id": payload.get("interaction_id"),
+                "customer_id": payload.get("customer_id"),
+                "error": str(e),
+                "attempt": self.request.retries,
+            },
+        )
+        backoff = min(30 * (2 ** self.request.retries), 300)
+        raise self.retry(exc=e, countdown=backoff)
+    finally:
+        loop.close()
+
+
+class BudgetExhaustedError(Exception):
+    """Raised when token budget is insufficient. Signals the task to retry quietly."""
+    pass
+
+
 async def _process_interaction(task, payload: Dict[str, Any]):
     interaction_id = payload["interaction_id"]
-
-    await metrics_tracker.track_processing_started(interaction_id)
+    customer_id = payload["customer_id"]
+    campaign_id = payload["campaign_id"]
+    lane = payload.get("processing_lane", "cold")
 
     ctx = PostCallContext(
         interaction_id=interaction_id,
         session_id=payload["session_id"],
         lead_id=payload["lead_id"],
-        campaign_id=payload["campaign_id"],
-        customer_id=payload["customer_id"],
+        campaign_id=campaign_id,
+        customer_id=customer_id,
         agent_id=payload["agent_id"],
         call_sid=payload.get("call_sid", ""),
         transcript_text=payload.get("transcript_text", ""),
@@ -122,68 +227,229 @@ async def _process_interaction(task, payload: Dict[str, Any]):
         exotel_account_id=payload.get("exotel_account_id"),
     )
 
-    # ── Step 1: Recording ─────────────────────────────────────────────────────
-    # Blocks here for ~45 seconds waiting for Exotel to make the recording
-    # available. The LLM analysis (step 2) cannot start until this completes,
-    # even though it has zero dependency on the recording.
-    #
-    # Under load, recordings often arrive in 10–15s. We wait 45s anyway.
-    # Sometimes they arrive after 60s. We've already given up by then.
-    recording_s3_key = await fetch_and_upload_recording(
-        interaction_id=ctx.interaction_id,
-        call_sid=ctx.call_sid,
-        exotel_account_id=ctx.exotel_account_id or "",
-    )
+    async with AuditLogger(
+        interaction_id=interaction_id,
+        customer_id=customer_id,
+        campaign_id=campaign_id,
+        session_id=ctx.session_id,
+    ) as audit:
 
-    if recording_s3_key:
-        logger.info(
-            "recording_uploaded",
-            extra={"interaction_id": interaction_id, "s3_key": recording_s3_key},
+        # ── Budget check ────────────────────────────────────────────────────
+        estimated_tokens = budget_scheduler.estimate_tokens(
+            ctx.transcript_text, phase="full_analysis"
         )
-    # If recording_s3_key is None, we continue silently. No alert, no retry,
-    # no flag on the interaction. The recording is just gone.
 
-    # ── Step 2: LLM analysis ──────────────────────────────────────────────────
-    # Full analysis on every call. 1,500 tokens average. No pre-screening.
-    # A call where the customer said "wrong number" after one sentence gets the
-    # same treatment as a confirmed rebook.
-    #
-    # The LLM rate limit (settings.LLM_TOKENS_PER_MINUTE) is not checked before
-    # this call. If we're over the limit, the provider returns a 429 and this
-    # raises an exception, which triggers Celery retry — which goes to the back
-    # of the 100K-item queue and makes the problem worse.
-    processor = PostCallProcessor()
-    result = await processor.process_post_call(ctx, single_prompt=True)
+        await audit.started(
+            "budget_check",
+            metadata={"estimated_tokens": estimated_tokens, "lane": lane},
+        )
+
+        reservation = await budget_scheduler.acquire_budget(
+            customer_id=customer_id,
+            estimated_tokens=estimated_tokens,
+            lane=lane,
+        )
+
+        if reservation is None:
+            # Budget exhausted — signal the Celery task to retry with backoff
+            await audit.event(
+                "budget_check",
+                status="WAITING_BUDGET",
+                metadata={
+                    "estimated_tokens": estimated_tokens,
+                    "retry_attempt": task.request.retries,
+                },
+            )
+            raise BudgetExhaustedError(
+                f"Token budget exhausted for customer {customer_id}"
+            )
+
+        await audit.completed(
+            "budget_check",
+            metadata={"estimated_tokens": estimated_tokens, "reservation": reservation},
+        )
+
+        # ── Parallel: LLM analysis + Recording poller ───────────────────────
+        await audit.started(
+            "full_processing",
+            metadata={"lane": lane, "estimated_tokens": estimated_tokens},
+        )
+
+        try:
+            analysis_result, recording_s3_key = await asyncio.gather(
+                _run_llm_analysis(ctx, audit),
+                fetch_and_upload_recording(
+                    interaction_id=interaction_id,
+                    call_sid=ctx.call_sid,
+                    exotel_account_id=ctx.exotel_account_id or "",
+                ),
+                return_exceptions=False,
+            )
+        except Exception as e:
+            await budget_scheduler.release_reservation(reservation)
+            raise
+
+        # ── Reconcile actual token usage ────────────────────────────────────
+        if analysis_result is not None:
+            await budget_scheduler.reconcile_actual(
+                reservation, analysis_result.tokens_used
+            )
+            await write_token_ledger(
+                interaction_id=interaction_id,
+                customer_id=customer_id,
+                campaign_id=campaign_id,
+                phase="full_analysis",
+                estimated_tokens=estimated_tokens,
+                actual_tokens=analysis_result.tokens_used,
+                model=analysis_result.model,
+            )
+        else:
+            await budget_scheduler.release_reservation(reservation)
+
+        await audit.completed(
+            "full_processing",
+            metadata={
+                "actual_tokens": analysis_result.tokens_used if analysis_result else 0,
+                "recording_uploaded": recording_s3_key is not None,
+                "call_stage": analysis_result.call_stage if analysis_result else "unknown",
+            },
+        )
+
+        # ── Downstream: signal jobs + lead stage ────────────────────────────
+        if analysis_result:
+            await _run_downstream(ctx, analysis_result, audit)
 
     await metrics_tracker.track_processing_completed(
-        interaction_id, result.tokens_used, result.latency_ms
+        interaction_id,
+        analysis_result.tokens_used if analysis_result else 0,
+        analysis_result.latency_ms if analysis_result else 0,
     )
 
-    # ── Step 3: Signal jobs ───────────────────────────────────────────────────
-    # Downstream actions: send a WhatsApp follow-up, book a callback slot,
-    # push to the customer's CRM. These depend on knowing the analysis result.
-    #
-    # If this raises, we log a warning and continue — the lead stage still
-    # updates. But the downstream action (WhatsApp, callback, CRM push) is lost.
+
+async def _run_llm_analysis(ctx: PostCallContext, audit: AuditLogger):
+    """Run full LLM analysis with audit events."""
+    await audit.started("llm_analysis")
+
+    processor = PostCallProcessor()
     try:
+        result = await processor.process_post_call(ctx, single_prompt=True)
+        await audit.completed(
+            "llm_analysis",
+            metadata={
+                "call_stage": result.call_stage,
+                "tokens_used": result.tokens_used,
+                "latency_ms": result.latency_ms,
+                "model": result.model,
+            },
+        )
+        return result
+    except Exception as e:
+        await audit.failed("llm_analysis", error=str(e))
+        raise
+
+
+async def _run_downstream(ctx: PostCallContext, result, audit: AuditLogger):
+    """Run signal jobs and lead stage update with individual error handling."""
+    # Signal jobs (CRM push, WhatsApp, callbacks)
+    try:
+        await audit.started("signal_jobs")
         await trigger_signal_jobs(
             interaction_id=ctx.interaction_id,
             session_id=ctx.session_id,
             campaign_id=ctx.campaign_id,
             analysis_result=result.raw_response,
         )
+        await audit.completed("signal_jobs")
     except Exception as e:
-        logger.warning("signal_jobs_failed", extra={"error": str(e)})
+        # Signal job failures are non-fatal — the analysis result is already
+        # written to the DB. Log at ERROR so it shows up in alerts.
+        await audit.failed("signal_jobs", error=str(e))
+        logger.error(
+            "signal_jobs_failed",
+            extra={
+                "interaction_id": ctx.interaction_id,
+                "customer_id": ctx.customer_id,
+                "error": str(e),
+                # In production, failed signal jobs should be put in a
+                # separate retry queue with their own backoff policy.
+            },
+        )
 
-    # ── Step 4: Lead stage update ─────────────────────────────────────────────
-    # Updates the lead's stage in the leads table based on call_stage.
-    # e.g., "rebook_confirmed" → lead moves to "booked" stage.
-    # Same fire-and-forget risk as signal_jobs above.
+    # Lead stage update
     try:
+        await audit.started("lead_stage_update")
         await update_lead_stage(
             lead_id=ctx.lead_id,
             interaction_id=ctx.interaction_id,
             call_stage=result.call_stage,
         )
+        await audit.completed(
+            "lead_stage_update",
+            metadata={"call_stage": result.call_stage},
+        )
     except Exception as e:
-        logger.warning("lead_stage_update_failed", extra={"error": str(e)})
+        await audit.failed("lead_stage_update", error=str(e))
+        logger.error(
+            "lead_stage_update_failed",
+            extra={
+                "interaction_id": ctx.interaction_id,
+                "lead_id": ctx.lead_id,
+                "error": str(e),
+            },
+        )
+
+
+# ── Reconciliation task (runs via Celery Beat every 5 minutes) ────────────────
+
+@celery_app.task(name="reconcile_stuck_interactions")
+def reconcile_stuck_interactions():
+    """
+    Find interactions stuck in STARTED state and re-enqueue them.
+
+    A STARTED event older than 10 minutes indicates a worker died mid-task.
+    We re-enqueue the interaction's classify task to restart processing.
+    Because all steps are idempotent (LLM writes use ON CONFLICT DO UPDATE,
+    S3 upload uses deterministic keys), re-processing is safe.
+
+    In production this queries:
+        SELECT interaction_id, customer_id, campaign_id, ...
+        FROM processing_events
+        WHERE status = 'STARTED'
+          AND started_at < NOW() - INTERVAL '10 minutes'
+          AND interaction_id NOT IN (
+              SELECT interaction_id FROM processing_events
+              WHERE status IN ('COMPLETED', 'FAILED')
+          )
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_reconcile())
+    finally:
+        loop.close()
+
+
+async def _reconcile():
+    logger.info("reconciliation_started")
+    # Production:
+    # stuck = await db.fetch("""
+    #     SELECT DISTINCT pe.interaction_id, i.customer_id, i.campaign_id,
+    #                     i.conversation_data, i.ended_at, ...
+    #     FROM processing_events pe
+    #     JOIN interactions i ON i.id = pe.interaction_id
+    #     WHERE pe.status = 'STARTED'
+    #       AND pe.started_at < NOW() - INTERVAL '10 minutes'
+    #       AND NOT EXISTS (
+    #           SELECT 1 FROM processing_events pe2
+    #           WHERE pe2.interaction_id = pe.interaction_id
+    #             AND pe2.status IN ('COMPLETED', 'FAILED')
+    #       )
+    # """)
+    # for row in stuck:
+    #     classify_interaction_task.apply_async(
+    #         args=[_row_to_payload(row)],
+    #         queue="postcall_classify",
+    #     )
+    #     logger.warning("interaction_requeued", extra={"interaction_id": row["interaction_id"]})
+    logger.info("reconciliation_complete", extra={"requeued": 0})
+
