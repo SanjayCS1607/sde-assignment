@@ -105,17 +105,6 @@ async def end_interaction(
                 extra={"interaction_id": str(interaction_id)},
             )
 
-            # These asyncio.create_tasks share the FastAPI event loop.
-            # If the server restarts between the 200 response and these
-            # completing, they vanish with no trace. No retry, no record.
-            asyncio.create_task(
-                trigger_signal_jobs(
-                    interaction_id=str(interaction_id),
-                    session_id=str(session_id),
-                    campaign_id=interaction["campaign_id"],
-                    analysis_result={"call_stage": "short_call"},
-                )
-            )
             asyncio.create_task(
                 update_lead_stage(
                     lead_id=interaction["lead_id"],
